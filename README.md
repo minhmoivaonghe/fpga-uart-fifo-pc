@@ -4,7 +4,7 @@ A Verilog implementation of a **UART** communication link between a PC and an FP
 
 ## Demo
 
-[![Demo video](https://img.youtube.com/vi/YOUR_VIDEO_ID/maxresdefault.jpg)](https://www.youtube.com/watch?v=YOUR_VIDEO_ID)
+[![Demo video] - docs]
 
 > Watch the full demo on YouTube: https://www.youtube.com/watch?v=YOUR_VIDEO_ID
 
