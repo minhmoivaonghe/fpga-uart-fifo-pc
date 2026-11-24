@@ -1,74 +1,137 @@
-# FPGA UART Echo with FIFO Buffer
+# UART Loopback with FIFO Buffer in SystemVerilog
 
-A Verilog implementation of a **UART** communication link between a PC and an FPGA. Data sent from the PC is received by the FPGA, buffered in a **FIFO**, shown on **LEDs**, and transmitted back to the PC unchanged (echo). Implemented on an Intel/Altera **Cyclone IV EP4CE6** FPGA.
+A synthesizable **UART (8N1) transceiver with a 64-byte FIFO buffer**, written in SystemVerilog for FPGA targets. Bytes received on the `rx` pin are buffered in a FIFO, then read back out, **echoed on the `tx` pin**, and shown on 8 LEDs.
 
-## Demo
+## Highlights
 
-[![Demo video] - docs]
+- **UART receiver and transmitter** in 8N1 format (1 start bit, 8 data bits, no parity, 1 stop bit), LSB first.
+- **16x oversampling**: the start bit is validated at its midpoint and each data bit is sampled at the middle of the bit period, which improves noise immunity.
+- **Synchronous 64 x 8-bit FIFO** using 7-bit read/write pointers, where the extra MSB distinguishes the full and empty states.
+- **FSM-based design**: the receiver and transmitter are each implemented as finite state machines.
+- **Clock-enable style timing**: a single `tick` strobe (one pulse every 163 clock cycles) drives both RX and TX timing.
+- Asynchronous, active-high reset.
+- Modular, hierarchical design with a clear top-level integration.
 
+## Skills Demonstrated
 
-## Overview
-
-The PC sends bytes through a serial terminal. The FPGA receives each byte, stores it in a FIFO, displays the received value on LEDs, and sends the same data back to the PC. The terminal therefore shows exactly what was sent, which verifies correct two-way communication.
-
-## Features
-
-- UART receiver and transmitter (8N1)
-- Synchronous FIFO to decouple the receive and transmit paths
-- Control FSM coordinating receive, buffering and transmit
-- LED output showing the last received data
-- Self-checking testbench for simulation
-
-## Hardware
-
-| Item | Description |
-|------|-------------|
-| FPGA board | Intel/Altera Cyclone IV EP4CE6 |
-| PC link | USB-to-UART adapter |
-| Output | LEDs |
-| Tool | Quartus II |
+RTL design in SystemVerilog, finite state machine design, serial communication protocols (UART), FIFO and pointer-based flow control, clock division and baud-rate generation, and module integration for FPGA.
 
 ## System Architecture
 
 ```
-PC --TX--> UART RX --> FIFO --> Control FSM --> UART TX --RX--> PC
-                         |
-                         +--> LEDs (received data)
+                 ┌──────────────────────────── top ────────────────────────────┐
+                 │                                                             │
+   rx ──────────►│  ┌─────────────────────┐  data[7:0]   ┌──────────────┐ dt    │
+                 │  │ control (UART RX)   ├─────────────►│ fifo 64x8    ├──┬───►│──► led[7:0]
+                 │  │  ┌─────┐            │  w (write)   │              │  │    │
+                 │  │  │ tik │──► tick ───┼──┐           │              │  │    │
+                 │  │  └─────┘            ├─────────────►│              │  │    │
+                 │  └─────────────────────┘              └──────▲───────┘  │    │
+                 │                                    r (read)  │ empty    │    │
+                 │                                       ┌──────┴───────┐  │    │
+                 │                      tick ───────────►│ UART TX (FSM)│◄─┘    │
+                 │                                       └──────┬───────┘       │
+                 └──────────────────────────────────────────────┼───────────────┘
+                                                                ▼
+                                                               tx
 ```
 
-## Project Structure
+**Data flow**
+
+1. A host (e.g. a PC) sends a byte to the `rx` pin.
+2. `control` decodes the byte and raises the write strobe `w`.
+3. `fifo` stores the byte.
+4. `top` detects that the FIFO is not empty, reads the byte, and displays it on `led`.
+5. `top` transmits the same byte back on `tx` (echo).
+
+## Repository Structure
+
+| File | Modules | Description |
+|------|---------|-------------|
+| `controldesign.sv` | `tik`, `control` | `tik`: tick generator for baud timing. `control`: UART receiver FSM that outputs the received byte and a write strobe. |
+| `fifodesign.sv` | `fifo` | 64 x 8-bit FIFO with an empty flag. |
+| `top.sv` | `top` | Top-level module: connects the receiver and FIFO, and contains the UART transmitter FSM and LED output. |
+
+> Note: `design.sv` in the working folder duplicates `controldesign.sv`, so only one of them should be included in a project.
+
+## Module Details
+
+### `tik`: Baud Tick Generator
+
+A 26-bit counter counts from 0 to 162 and produces a one-cycle `tick` pulse, giving **one tick every 163 clock cycles**. Each UART bit lasts 16 ticks:
 
 ```
-fpga-uart-fifo-pc/
-├── src/        # Verilog sources: UART design, FIFO, control FSM, top level
-├── sim/        # Testbench
-├── docs/       # Block diagrams, waveforms, photos
-└── README.md
+Bit period = 163 x 16 = 2608 clock cycles
+Baud rate  = f_clk / 2608
 ```
+
+| Clock | Resulting baud rate | Nearest standard rate |
+|-------|---------------------|-----------------------|
+| 50 MHz  | ~19,171 | 19,200 (~0.15% error) |
+| 100 MHz | ~38,343 | 38,400 (~0.15% error) |
+
+To target another clock or baud rate, use `N = f_clk / (baud x 16)` and adjust the compare value (`162` = N - 1).
+
+### `control`: UART Receiver
+
+| State | Behavior |
+|-------|----------|
+| `ide` | Waits for `rx` to go low (start bit) and counts about 8 to 9 ticks to reach the middle of the start bit. If `rx` returns high, the counter is cleared (glitch rejection). |
+| `start` | Samples `rx` every 16 ticks and shifts each bit into `data` (LSB first), for 8 bits. |
+| `stop` | Waits 16 ticks for the stop bit, pulses `w` for one cycle to signal a valid byte, then returns to `ide`. |
+
+### `fifo`: 64-Byte Buffer
+
+- Memory array of 64 x 8 bits.
+- 7-bit read pointer `rd` and write pointer `wr` (6 low bits are the address, the MSB is a wrap-around flag):
+  - `empty = (rd == wr)`
+  - `full  = (rd[5:0] == wr[5:0]) && (rd[6] != wr[6])`
+- Writes occur when `w` is high and the FIFO is not full. Reads occur when `r` is high and the FIFO is not empty. Read data appears on `dt` one clock cycle later.
+
+### `top`: Integration and UART Transmitter
+
+| Step | Action |
+|------|--------|
+| `0` | If the FIFO is not empty, assert read strobe `r` and move to step 1. |
+| `1` | Wait one cycle for FIFO data to become valid on `dt`. |
+| `2` | Drive `led` with `dt` and run the transmit FSM: start bit, 8 data bits (LSB first), stop bit. Then return to step 0. |
+
+The `tx` output is driven only while `tx_ena` is high and is otherwise high-impedance.
+
+## Ports
+
+| Module | Inputs | Outputs |
+|--------|--------|---------|
+| `top` | `clk`, `rst`, `rx` | `tx`, `led[7:0]` |
+| `control` | `clk`, `rst`, `rx` | `data[7:0]`, `tick`, `w` |
+| `fifo` | `clk`, `rst`, `data[7:0]`, `w`, `r` | `dt[7:0]`, `fifo_empty` |
 
 ## Getting Started
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/minhmoivaonghe/fpga-uart-fifo-pc.git
-   ```
-2. Open Quartus II and create a new project targeting **EP4CE6**.
-3. Add all files from `src/` and set the top-level entity.
-4. Assign pins for the clock, UART RX/TX and LEDs.
-5. Compile and program the board.
-6. Connect the USB-to-UART adapter, open a serial terminal (e.g. PuTTY, Tera Term) with the matching baud rate, 8 data bits, no parity, 1 stop bit.
-7. Type characters: they are echoed back and shown on the LEDs.
+### Simulation
 
-## Simulation
+Any SystemVerilog-capable simulator works (Verilator, Icarus Verilog with `-g2012`, ModelSim/Questa, Vivado Simulator). Example with Icarus Verilog and your own testbench `tb.sv`:
 
-Run the testbench in `sim/` with ModelSim/Questa to verify the UART and FIFO behaviour.
+```bash
+iverilog -g2012 -o sim tb.sv top.sv controldesign.sv fifodesign.sv
+vvp sim
+```
 
-## Results
+### FPGA
 
-Every byte sent from the PC is returned unchanged and displayed on the LEDs. See the demo video above.
+1. Create a project in your vendor tool (Vivado, Quartus, etc.) and add `top.sv`, `controldesign.sv`, and `fifodesign.sv`. Set `top` as the top-level module.
+2. Assign pins for `clk`, `rst`, `rx`, `tx`, and `led[7:0]` according to your board.
+3. Check that the divider value in `tik` matches your board clock (see the baud table above).
+4. Program the board, open a serial terminal set to **8 data bits, no parity, 1 stop bit** at the matching baud rate, and type characters. They will be echoed back and their ASCII codes shown on the LEDs.
 
-## Author
+## Future Improvements
 
-**Do Thanh Minh** — Electrical/Electronic Engineering student, Industrial University of Ho Chi Minh City (IUH)
-Interested in FPGA design and Design Verification.
-GitHub: [@minhmoivaonghe](https://github.com/minhmoivaonghe)
+- Add a self-checking testbench.
+- Parameterize the baud divider and FIFO depth.
+- Add framing-error detection and `full` / overflow status outputs.
+- Drive `tx` high when idle (standard UART idle level) instead of high-impedance.
+- Optional parity bit support.
+
+## License
+
+Add a license of your choice (for example MIT) as a `LICENSE` file in the repository.
